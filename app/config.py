@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS copy_session_entries (
 CREATE INDEX IF NOT EXISTS copy_session_entries_segment_idx
     ON copy_session_entries (session_id, segment_no, ordinal);
 
+-- Revision baseline captured for EVERY target path in the same
+-- transaction (and lock snapshot) as the manifest.  A NULL revision_id
+-- records "the target did not exist when the session was created"; this
+-- is the identity acknowledgements compare against, so a re-publish of
+-- the very same bytes after baseline is a conflict rather than an
+-- idempotent no-op.
+CREATE TABLE IF NOT EXISTS copy_session_target_baselines (
+    session_id  text NOT NULL REFERENCES copy_sessions (id) ON DELETE CASCADE,
+    ordinal     integer NOT NULL,
+    target_path text NOT NULL,
+    revision_id bigint REFERENCES revisions (id),
+    revision_no bigint,
+    sha256      text,
+    PRIMARY KEY (session_id, target_path)
+);
+
 -- One row per acknowledged segment: the persisted batch result that
 -- makes repeated acknowledgements and replays byte-identical.  Stored
 -- as text (not jsonb) to preserve the exact key order of the original

@@ -279,6 +279,166 @@ def test_ack_idempotent_when_content_already_at_target(client):
     assert r.json()["applied"][0]["action"] == "already_present"
 
 
+# ---- baseline: identical re-publish after creation is a conflict ----------------
+
+def test_ack_same_content_republished_after_baseline_conflicts(client):
+    """The bug: identical bytes published after session creation must not
+    be mistaken for an idempotent already_present skip."""
+    prefix = _prefix("repub-same")
+    paths = _put_sources(client, prefix, {"a.txt": b"same-bytes"})
+    sid = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    seg = _pull(client, sid).json()
+
+    # After the session pinned its (absent) baseline, publish the exact
+    # same bytes to the target independently.
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+
+    r = _ack(client, sid, seg["cursor"])
+    assert r.status_code == 409
+    result = r.json()
+    assert result["status"] == "conflict"
+    assert result["applied"] == []
+    assert len(result["conflicts"]) == 1
+    conflict = result["conflicts"][0]
+    assert conflict["reason"] == "target_republished_same_content"
+    assert conflict["target_path"] == f"backup/{prefix}/a.txt"
+    assert conflict["expected_sha256"] == SHA_OF(b"same-bytes")
+    assert conflict["actual_sha256"] == SHA_OF(b"same-bytes")
+    assert conflict["actual_revision_no"] == 1
+    assert conflict["baseline_revision_no"] is None
+    # Cursor does not advance; recovery points back at this segment.
+    assert result["resume"]["next_segment"] == 0
+    assert result["resume"]["last_confirmed_cursor"] is None
+    desc = client.get(f"/copy-sessions/{sid}").json()
+    assert desc["status"] == "open"
+    assert desc["next_segment"] == 0
+
+    # Replay returns the identical stored conflict result.
+    assert _ack(client, sid, seg["cursor"]).content == r.content
+
+
+def test_ack_same_content_new_revision_on_existing_target_conflicts(client):
+    """Baseline pinned rev 1 (identical content); rev 2 of the same bytes
+    after session creation is still a change of revision identity."""
+    prefix = _prefix("repub-exist")
+    paths = _put_sources(client, prefix, {"a.txt": b"same-bytes"})
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+
+    sid = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    seg = _pull(client, sid).json()
+
+    # Re-publish byte-identical content as a new revision.
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+
+    r = _ack(client, sid, seg["cursor"])
+    assert r.status_code == 409
+    conflict = r.json()["conflicts"][0]
+    assert conflict["reason"] == "target_republished_same_content"
+    assert conflict["actual_revision_no"] == 2
+    assert conflict["baseline_revision_no"] == 1
+
+    # The cursor is still not advanced and the session stays resumable.
+    desc = client.get(f"/copy-sessions/{sid}").json()
+    assert desc["next_segment"] == 0
+
+
+def test_ack_different_content_published_after_baseline_conflicts(client):
+    prefix = _prefix("repub-diff")
+    paths = _put_sources(client, prefix, {"a.txt": b"alpha"})
+    sid = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    seg = _pull(client, sid).json()
+
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"different")
+    r = _ack(client, sid, seg["cursor"])
+    assert r.status_code == 409
+    conflict = r.json()["conflicts"][0]
+    assert conflict["reason"] == "content_diverged"
+    assert conflict["actual_sha256"] == SHA_OF(b"different")
+    assert conflict["baseline_revision_no"] is None
+
+
+def test_same_content_republish_rolls_back_whole_batch(client):
+    """One republished target aborts the entire segment; sibling targets
+    that were absent at baseline must not be created."""
+    prefix = _prefix("repub-batch")
+    bodies = {"a.txt": b"alpha", "b.txt": b"beta"}
+    paths = _put_sources(client, prefix, bodies)
+    sid = _create_session(client, paths, "backup/", segment_size=2).json()["session"]
+    cursor = _pull(client, sid).json()["cursor"]
+
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"alpha")
+
+    r = _ack(client, sid, cursor)
+    assert r.status_code == 409
+    assert len(r.json()["conflicts"]) == 1
+    assert r.json()["conflicts"][0]["target_path"] == f"backup/{prefix}/a.txt"
+    # No partial application.
+    assert client.get(f"/objects/backup/{prefix}/a.txt").content == b"alpha"
+    assert client.get(f"/objects/backup/{prefix}/b.txt").status_code == 404
+    # Not advanced: re-acking after fixing the target still cannot happen
+    # on the old session (its baseline still says absent -> conflict), so
+    # recovery is a fresh session.
+    assert client.get(f"/copy-sessions/{sid}").json()["next_segment"] == 0
+
+
+def test_recover_after_same_content_republish_via_new_session(client):
+    prefix = _prefix("repub-recover")
+    paths = _put_sources(client, prefix, {"a.txt": b"same-bytes"})
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+    sid1 = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    cursor = _pull(client, sid1).json()["cursor"]
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+    assert _ack(client, sid1, cursor).status_code == 409
+
+    # A fresh session re-pins the baseline at the new revision identity;
+    # identical content is now a legitimate idempotent skip.
+    sid2 = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    seg = _pull(client, sid2).json()
+    r = _ack(client, sid2, seg["cursor"])
+    assert r.status_code == 200
+    assert r.json()["applied"][0]["action"] == "already_present"
+
+
+def test_legacy_session_without_baseline_is_not_allowed_on_digest(client):
+    """An unfinished session created before the baseline upgrade has no
+    revision identity: matching digests alone must never let it apply."""
+    import asyncio
+    import asyncpg
+    import os
+
+    prefix = _prefix("legacy")
+    paths = _put_sources(client, prefix, {"a.txt": b"same-bytes"})
+    sid = _create_session(client, paths, "backup/", segment_size=1).json()["session"]
+    seg = _pull(client, sid).json()
+
+    async def strip_baselines():
+        conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+        try:
+            await conn.execute(
+                "DELETE FROM copy_session_target_baselines WHERE session_id = $1",
+                sid,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(strip_baselines())
+
+    # Identical content at the target would previously pass on digest; it
+    # must now be refused with baseline_missing.
+    client.put(f"/objects/backup/{prefix}/a.txt", content=b"same-bytes")
+    r = _ack(client, sid, seg["cursor"])
+    assert r.status_code == 409
+    result = r.json()
+    assert result["status"] == "baseline_missing"
+    assert result["conflicts"] == []
+    assert result["resume"]["next_segment"] == 0
+    assert client.get(f"/copy-sessions/{sid}").json()["next_segment"] == 0
+
+    # Pulls of the legacy session still work so a replacement session can
+    # be built from a fresh snapshot.
+    assert _pull(client, sid).status_code == 200
+
+
 def test_concurrent_acks_of_same_segment_converge(client):
     import threading
 

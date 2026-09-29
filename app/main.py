@@ -459,8 +459,27 @@ async def create_copy_session(request: Request):
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # One statement snapshot + FOR SHARE locks: the source set
-            # boundary is frozen for the rest of this transaction.
+            # Manifest shape depends only on request parameters, not the
+            # database, so build it before taking locks.
+            provisional = [
+                (p, target_prefix + p)
+                for p in paths
+                if resume_after is None or p > resume_after
+            ]
+            target_paths = [t for _, t in provisional]
+
+            # Freeze every involved path in one globally sorted lock set:
+            # placeholders are created for targets without a revision, and
+            # the same ascending order acknowledgements use for FOR UPDATE
+            # guarantees creation cannot deadlock with a concurrent apply.
+            await database.lock_path_set(
+                conn, sorted(set(paths + target_paths))
+            )
+
+            # Both snapshots are now read inside the held locks, so the
+            # pinned source revisions and the target baselines come from
+            # one frozen boundary (a concurrent publish blocks until
+            # commit and cannot sneak between the two reads).
             rows = await database.snapshot_source_revisions(conn, paths)
             found = {r["source_path"] for r in rows}
             missing = [p for p in paths if p not in found]
@@ -470,17 +489,16 @@ async def create_copy_session(request: Request):
                     status_code=404,
                 )
 
+            rev_by_path = {r["source_path"]: r for r in rows}
             entries: list[database.CopyEntry] = []
-            for row in rows:
-                source_path = row["source_path"]
-                if resume_after is not None and source_path <= resume_after:
-                    continue  # already confirmed in the previous session
+            for source_path, target_path in provisional:
+                row = rev_by_path[source_path]
                 entries.append(
                     database.CopyEntry(
                         ordinal=len(entries),
                         segment_no=len(entries) // segment_size,
                         source_path=source_path,
-                        target_path=target_prefix + source_path,
+                        target_path=target_path,
                         revision_id=row["revision_id"],
                         revision_no=row["revision_no"],
                         sha256=row["sha256"],
@@ -488,6 +506,20 @@ async def create_copy_session(request: Request):
                         length=row["length"],
                     )
                 )
+
+            baseline_rows = await database.snapshot_target_baselines(
+                conn, target_paths
+            )
+            baselines = [
+                database.TargetBaseline(
+                    ordinal=e.ordinal,
+                    target_path=e.target_path,
+                    revision_id=baseline_rows[e.target_path]["revision_id"],
+                    revision_no=baseline_rows[e.target_path]["revision_no"],
+                    sha256=baseline_rows[e.target_path]["sha256"],
+                )
+                for e in entries
+            ]
 
             session_id = uuid.uuid4().hex
             mhash = manifest_hash(entries)
@@ -499,6 +531,7 @@ async def create_copy_session(request: Request):
                 mhash,
                 segment_size,
                 entries,
+                baselines,
             )
 
     total_segments = (
@@ -624,7 +657,9 @@ async def pull_copy_segment(
 async def ack_copy_segment(session_id: str, request: Request):
     """Acknowledge one segment: apply it to the target prefix atomically.
 
-    The whole segment commits as one batch; on conflict or failure
+    Targets are checked against the revision baselines captured at
+    session creation, so any publish after the baseline -- even of the
+    identical bytes -- is a 409 conflict.  On conflict or failure
     nothing is applied and a structured result (conflicting objects +
     resume position) is returned.  The result is persisted, so repeated
     or replayed acknowledgements return the very same batch result.
@@ -659,13 +694,39 @@ async def ack_copy_segment(session_id: str, request: Request):
         if cur.segment != session.next_segment:
             return await _cursor_expired(conn, secret, session, "cursor_expired")
 
+        # Sessions created before baselines existed have no revision
+        # identity for their targets: a digest-only check cannot tell
+        # "unchanged" from "re-published identical bytes", so unfinished
+        # segments must be re-pinned as a new session instead of being
+        # let through on matching hashes.  (Already-persisted acks were
+        # replayed above and keep their original result.)
+        if not await database.session_has_baselines(conn, session.id):
+            return JSONResponse(
+                {
+                    "detail": "baseline_missing",
+                    "status": "baseline_missing",
+                    "session": session.id,
+                    "segment": cur.segment,
+                    "cursor": token,
+                    "applied": [],
+                    "conflicts": [],
+                    "resume": await _resume_payload(conn, secret, session),
+                },
+                status_code=409,
+            )
+
         entries = await database.fetch_segment_entries(conn, session.id, cur.segment)
+        baselines = await database.fetch_segment_baselines(
+            conn, session.id, cur.segment
+        )
         resume_before = await _resume_payload(conn, secret, session)
 
         tx = conn.transaction()
         await tx.start()
         try:
-            applied, conflicts = await database.apply_copy_entries(conn, entries)
+            applied, conflicts = await database.apply_copy_entries(
+                conn, entries, baselines
+            )
         except Exception:
             await tx.rollback()
             return JSONResponse(
