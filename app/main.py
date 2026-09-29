@@ -12,9 +12,15 @@ Request flow for GET/HEAD/PUT on ``/objects/{path}``:
 
 Resumable copy sessions (``/copy-sessions``) add snapshot replication on
 top: a session pins a manifest of source revisions in one database
-snapshot, serves it in cursor-addressed segments that are byte-identical
-on every pull, and applies each acknowledged segment to the target
-prefix as a single atomic batch.
+snapshot *and* records each target path's revision-identity baseline in
+that same snapshot (including "target did not exist yet").  Segments are
+served in cursor-addressed form that is byte-identical on every pull;
+acknowledging a segment locks the targets and compares revision
+identities against the baseline, so any publish after session creation —
+even a byte-identical re-publish — is a 409 conflict rather than a
+digest-only "already present" skip.  A segment whose baseline was never
+captured (a session created before the upgrade) is rejected with
+``baseline_missing`` instead of being passed on digest equality.
 """
 from __future__ import annotations
 
@@ -22,7 +28,7 @@ import base64
 import os
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, Response
@@ -60,7 +66,7 @@ from .ranges import (
 DEFAULT_MEDIA_TYPE = "application/octet-stream"
 
 # HTTP status replayed alongside a stored copy-session batch result.
-ACK_STATUS_CODES = {"applied": 200, "conflict": 409}
+ACK_STATUS_CODES = {"applied": 200, "conflict": 409, "baseline_missing": 409}
 
 
 @dataclass(slots=True)
@@ -458,7 +464,10 @@ async def create_copy_session(request: Request):
 
     pool = request.app.state.pool
     async with pool.acquire() as conn:
-        async with conn.transaction():
+        # REPEATABLE READ: the source manifest and the target baselines
+        # are read from one transaction snapshot — the baseline reflects
+        # exactly the same database instant as the pinned sources.
+        async with conn.transaction(isolation="repeatable_read"):
             # One statement snapshot + FOR SHARE locks: the source set
             # boundary is frozen for the rest of this transaction.
             rows = await database.snapshot_source_revisions(conn, paths)
@@ -470,15 +479,15 @@ async def create_copy_session(request: Request):
                     status_code=404,
                 )
 
-            entries: list[database.CopyEntry] = []
+            candidate_entries: list[database.CopyEntry] = []
             for row in rows:
                 source_path = row["source_path"]
                 if resume_after is not None and source_path <= resume_after:
                     continue  # already confirmed in the previous session
-                entries.append(
+                candidate_entries.append(
                     database.CopyEntry(
-                        ordinal=len(entries),
-                        segment_no=len(entries) // segment_size,
+                        ordinal=0,
+                        segment_no=0,
                         source_path=source_path,
                         target_path=target_prefix + source_path,
                         revision_id=row["revision_id"],
@@ -486,6 +495,25 @@ async def create_copy_session(request: Request):
                         sha256=row["sha256"],
                         media_type=row["media_type"],
                         length=row["length"],
+                    )
+                )
+
+            # Target revision-identity baselines, same snapshot as the
+            # sources (including "target did not exist yet" for paths
+            # without an objects row).
+            target_paths = sorted({e.target_path for e in candidate_entries})
+            baselines = await database.snapshot_target_baselines(
+                conn, target_paths
+            )
+
+            entries: list[database.CopyEntry] = []
+            for candidate in candidate_entries:
+                entries.append(
+                    replace(
+                        candidate,
+                        ordinal=len(entries),
+                        segment_no=len(entries) // segment_size,
+                        baseline=baselines[candidate.target_path],
                     )
                 )
 
@@ -658,6 +686,39 @@ async def ack_copy_segment(session_id: str, request: Request):
         # an expired cursor from the client's point of view.
         if cur.segment != session.next_segment:
             return await _cursor_expired(conn, secret, session, "cursor_expired")
+
+        # Sessions created before revision baselines existed carry no
+        # target identity to compare against.  They must never pass on
+        # digest equality (a same-bytes re-publish would be invisible);
+        # the client resumes with a freshly snapshotted session instead.
+        if not await database.segment_baseline_captured(
+            conn, session.id, cur.segment
+        ):
+            result = {
+                "status": "baseline_missing",
+                "detail": "session predates revision baselines; create a"
+                " new session to capture a fresh target baseline and"
+                " resume with last_confirmed_cursor",
+                "session": session.id,
+                "segment": cur.segment,
+                "cursor": token,
+                "applied": [],
+                "conflicts": [],
+                "resume": await _resume_payload(conn, secret, session),
+            }
+            async with conn.transaction():
+                inserted = await database.insert_ack(
+                    conn, session.id, cur.segment, token,
+                    "baseline_missing", result,
+                )
+            if not inserted:
+                stored = await database.fetch_ack(conn, session.id, cur.segment)
+                if stored is not None:
+                    status, stored_result = stored
+                    return JSONResponse(
+                        stored_result, status_code=ACK_STATUS_CODES[status]
+                    )
+            return JSONResponse(result, status_code=409)
 
         entries = await database.fetch_segment_entries(conn, session.id, cur.segment)
         resume_before = await _resume_payload(conn, secret, session)

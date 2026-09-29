@@ -7,11 +7,14 @@ that row, and a streaming GET keeps its share lock until the body has
 been fully sent, so the revision selected for the headers can neither
 disappear nor be replaced while bytes are streamed.
 
-Copy sessions reuse the same building blocks: the manifest is captured
-with one ``FOR SHARE`` snapshot statement, and acknowledging a segment
-applies its entries inside a single transaction that takes ``FOR
-UPDATE`` locks on the target rows in ascending path order (so
-concurrent acknowledgements cannot deadlock).
+Copy sessions reuse the same building blocks: the manifest and the
+target revision-identity baselines are captured together in one
+REPEATABLE READ transaction (a ``FOR SHARE`` snapshot statement for the
+sources and one for the targets), and acknowledging a segment applies
+its entries inside a single transaction that first takes ``FOR UPDATE``
+locks on the target rows in ascending path order (so concurrent
+acknowledgements cannot deadlock) and then compares each target's
+current revision identity against the stored baseline.
 """
 from __future__ import annotations
 
@@ -205,6 +208,21 @@ class CopySession:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetBaseline:
+    """Revision identity of a target path as of the session snapshot.
+
+    ``revision_id is None`` pins the state "the target path had no
+    current revision yet".  Any current revision at acknowledge time is
+    then proof of a publish after the baseline was taken.
+    """
+
+    target_path: str
+    revision_id: int | None
+    revision_no: int | None
+    sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class CopyEntry:
     ordinal: int
     segment_no: int
@@ -215,6 +233,7 @@ class CopyEntry:
     sha256: str
     media_type: str
     length: int
+    baseline: TargetBaseline | None = None
 
 
 async def ensure_copy_secret(pool: asyncpg.Pool) -> str:
@@ -264,6 +283,45 @@ async def snapshot_source_revisions(
     )
 
 
+async def snapshot_target_baselines(
+    conn: asyncpg.Connection, target_paths: list[str]
+) -> dict[str, TargetBaseline]:
+    """Capture target revision identities from the transaction snapshot.
+
+    Run in the *same transaction* (and, under REPEATABLE READ, the same
+    statement snapshot) as :func:`snapshot_source_revisions`.  Existing
+    objects rows are ``FOR SHARE`` locked so a concurrent publish blocks
+    until the session (and its baseline) has been committed; paths with
+    no objects row at all are recorded as a ``None`` revision identity
+    ("target did not exist yet").
+    """
+    rows = await conn.fetch(
+        """
+        SELECT o.path AS target_path, r.id AS revision_id,
+               r.revision_no, r.sha256
+          FROM unnest($1::text[]) WITH ORDINALITY AS t(path, ord)
+          JOIN objects o ON o.path = t.path
+          LEFT JOIN revisions r ON r.id = o.current_id
+         ORDER BY t.ord
+         FOR SHARE OF o
+        """,
+        target_paths,
+    )
+    baselines: dict[str, TargetBaseline] = {}
+    for row in rows:
+        revision_id = row["revision_id"]
+        baselines[row["target_path"]] = TargetBaseline(
+            target_path=row["target_path"],
+            revision_id=None if revision_id is None else revision_id,
+            revision_no=row["revision_no"],
+            sha256=row["sha256"],
+        )
+    # Absent rows carry no lock and no revision identity.
+    for path in target_paths:
+        baselines.setdefault(path, TargetBaseline(path, None, None, None))
+    return baselines
+
+
 async def insert_copy_session(
     conn: asyncpg.Connection,
     session_id: str,
@@ -300,8 +358,10 @@ async def insert_copy_session(
         """
         INSERT INTO copy_session_entries
             (session_id, ordinal, segment_no, source_path, target_path,
-             revision_id, revision_no, sha256, media_type, length)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             revision_id, revision_no, sha256, media_type, length,
+             baseline_captured, baseline_revision_id,
+             baseline_revision_no, baseline_sha256)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         """,
         [
             (
@@ -315,6 +375,10 @@ async def insert_copy_session(
                 e.sha256,
                 e.media_type,
                 e.length,
+                e.baseline is not None,
+                None if e.baseline is None else e.baseline.revision_id,
+                None if e.baseline is None else e.baseline.revision_no,
+                None if e.baseline is None else e.baseline.sha256,
             )
             for e in entries
         ],
@@ -352,6 +416,14 @@ async def get_copy_session(
 
 
 def _to_copy_entry(row: asyncpg.Record) -> CopyEntry:
+    baseline = None
+    if row["baseline_captured"]:
+        baseline = TargetBaseline(
+            target_path=row["target_path"],
+            revision_id=row["baseline_revision_id"],
+            revision_no=row["baseline_revision_no"],
+            sha256=row["baseline_sha256"],
+        )
     return CopyEntry(
         ordinal=row["ordinal"],
         segment_no=row["segment_no"],
@@ -362,6 +434,7 @@ def _to_copy_entry(row: asyncpg.Record) -> CopyEntry:
         sha256=row["sha256"],
         media_type=row["media_type"],
         length=row["length"],
+        baseline=baseline,
     )
 
 
@@ -372,7 +445,9 @@ async def fetch_segment_entries(
     rows = await conn.fetch(
         """
         SELECT ordinal, segment_no, source_path, target_path, revision_id,
-               revision_no, sha256, media_type, length
+               revision_no, sha256, media_type, length,
+               baseline_captured, baseline_revision_id,
+               baseline_revision_no, baseline_sha256
           FROM copy_session_entries
          WHERE session_id = $1 AND segment_no = $2
          ORDER BY ordinal
@@ -381,6 +456,27 @@ async def fetch_segment_entries(
         segment_no,
     )
     return [_to_copy_entry(r) for r in rows]
+
+
+async def segment_baseline_captured(
+    conn: asyncpg.Connection, session_id: str, segment_no: int
+) -> bool:
+    """Whether every entry of the segment carries a revision baseline.
+
+    Upgrade-era sessions (created before baselines existed) have rows
+    with ``baseline_captured = FALSE``; their pending segments may not be
+    acknowledged by digest comparison alone.
+    """
+    value = await conn.fetchval(
+        """
+        SELECT COALESCE(bool_and(baseline_captured), TRUE)
+          FROM copy_session_entries
+         WHERE session_id = $1 AND segment_no = $2
+        """,
+        session_id,
+        segment_no,
+    )
+    return bool(value)
 
 
 async def fetch_revision_content(
@@ -462,25 +558,43 @@ async def apply_copy_entries(
 ) -> tuple[list[dict], list[dict]]:
     """Apply one segment to the target prefix inside the caller's transaction.
 
-    Target rows are locked in ascending path order (``FOR UPDATE``), so
-    concurrent batches and publishes serialise without deadlocks.  Each
-    entry is either created (target missing), already present (same
-    SHA-256: idempotent no-op) or conflicting (different content).  The
-    caller decides: commit everything, or roll back and report the
-    conflicts — never a partial application.
+    Every entry must carry the revision-identity baseline captured when
+    the session was created.  Target rows are locked in ascending path
+    order (``FOR UPDATE``), so concurrent batches and publishes serialise
+    without deadlocks.  Classification compares revision *identity*
+    against the baseline — not content digests — because a same-bytes
+    re-publish after the session was created still changes identity and
+    must be reported rather than silently skipped:
+
+    * **target absent at baseline, still absent** -> create revision 1;
+    * **target present at baseline, identity unchanged** ->
+      ``already_present`` (idempotent no-op; at baseline time the
+      content already equalled the pinned content);
+    * **any publish since the baseline** (identity changed, or a path
+      that was absent now exists — even byte-identical) -> conflict
+      ``published_after_session``;
+    * **identity unchanged but the baseline content already diverged**
+      from the pinned content -> conflict ``diverged_at_session``.
+
+    Locking and classification finish for the whole batch before any
+    revision is written, and the caller rolls back on any conflict, so
+    there is never a partial application.
     """
-    applied: list[dict] = []
-    conflicts: list[dict] = []
-    for entry in sorted(entries, key=lambda e: e.target_path):
-        # Upsert first so concurrent creators serialise on the same row.
+    ordered = sorted(entries, key=lambda e: e.target_path)
+
+    # Phase 1: materialise and lock every target row in path order, then
+    # read its current revision identity under the FOR UPDATE lock.
+    for entry in ordered:
         await conn.execute(
             "INSERT INTO objects (path) VALUES ($1)"
             " ON CONFLICT (path) DO NOTHING",
             entry.target_path,
         )
-        row = await conn.fetchrow(
+    currents: dict[str, asyncpg.Record | None] = {}
+    for entry in ordered:
+        currents[entry.target_path] = await conn.fetchrow(
             """
-            SELECT r.revision_no, r.sha256
+            SELECT r.id AS revision_id, r.revision_no, r.sha256
               FROM objects o
               JOIN revisions r ON r.id = o.current_id
              WHERE o.path = $1
@@ -488,52 +602,121 @@ async def apply_copy_entries(
             """,
             entry.target_path,
         )
-        if row is None:
-            # No current revision yet: copy the pinned revision as rev 1.
-            new_id = await conn.fetchval(
-                """
-                INSERT INTO revisions
-                    (object_path, revision_no, content, sha256, media_type)
-                SELECT $1, 1, content, sha256, media_type
-                  FROM revisions WHERE id = $2
-                RETURNING id
-                """,
-                entry.target_path,
-                entry.revision_id,
+
+    # Phase 2: classify against the baseline before writing anything.
+    conflicts: list[dict] = []
+    create_entries: list[CopyEntry] = []   # absent -> create
+    present_entries: list[CopyEntry] = []  # identity unchanged
+    for entry in ordered:
+        baseline = entry.baseline
+        if baseline is None:
+            # Defence in depth: the ack handler gates these out.
+            raise RuntimeError(
+                f"entry for {entry.target_path} has no revision baseline"
             )
-            await conn.execute(
-                "UPDATE objects SET current_id = $2 WHERE path = $1",
-                entry.target_path,
-                new_id,
+        row = currents[entry.target_path]
+        current_id = None if row is None else row["revision_id"]
+
+        if baseline.revision_id is None and current_id is not None:
+            conflicts.append(
+                _conflict(
+                    entry,
+                    row,
+                    reason="published_after_session",
+                    detail="target path did not exist when the session"
+                    " was created but a revision has been published since",
+                )
             )
-            applied.append(
-                {
-                    "target_path": entry.target_path,
-                    "source_path": entry.source_path,
-                    "revision_no": 1,
-                    "sha256": entry.sha256,
-                    "action": "created",
-                }
+        elif (
+            baseline.revision_id is not None
+            and current_id != baseline.revision_id
+        ):
+            conflicts.append(
+                _conflict(
+                    entry,
+                    row,
+                    reason="published_after_session",
+                    detail="target revision changed after the session"
+                    " baseline was captured",
+                )
             )
-        elif row["sha256"] == entry.sha256:
-            # Identical content already at the target: idempotent no-op.
-            applied.append(
-                {
-                    "target_path": entry.target_path,
-                    "source_path": entry.source_path,
-                    "revision_no": row["revision_no"],
-                    "sha256": entry.sha256,
-                    "action": "already_present",
-                }
-            )
+        elif current_id is None:
+            create_entries.append(entry)  # absent then and now
+        elif baseline.sha256 == entry.sha256:
+            present_entries.append(entry)  # same content, same identity
         else:
             conflicts.append(
-                {
-                    "target_path": entry.target_path,
-                    "source_path": entry.source_path,
-                    "expected_sha256": entry.sha256,
-                    "actual_sha256": row["sha256"],
-                    "actual_revision_no": row["revision_no"],
-                }
+                _conflict(
+                    entry,
+                    row,
+                    reason="diverged_at_session",
+                    detail="target already held different content when"
+                    " the session was created",
+                )
             )
-    return applied, conflicts
+
+    if conflicts:
+        return [], conflicts
+
+    # Phase 3: all clear — create the missing targets; the rest are
+    # idempotent no-ops.  Results are emitted in ascending target order.
+    applied: list[dict] = []
+    for entry in create_entries:
+        new_id = await conn.fetchval(
+            """
+            INSERT INTO revisions
+                (object_path, revision_no, content, sha256, media_type)
+            SELECT $1, 1, content, sha256, media_type
+              FROM revisions WHERE id = $2
+            RETURNING id
+            """,
+            entry.target_path,
+            entry.revision_id,
+        )
+        await conn.execute(
+            "UPDATE objects SET current_id = $2 WHERE path = $1",
+            entry.target_path,
+            new_id,
+        )
+        applied.append(
+            {
+                "target_path": entry.target_path,
+                "source_path": entry.source_path,
+                "revision_no": 1,
+                "sha256": entry.sha256,
+                "action": "created",
+            }
+        )
+    for entry in present_entries:
+        row = currents[entry.target_path]
+        applied.append(
+            {
+                "target_path": entry.target_path,
+                "source_path": entry.source_path,
+                "revision_no": row["revision_no"],
+                "sha256": entry.sha256,
+                "action": "already_present",
+            }
+        )
+    applied.sort(key=lambda a: a["target_path"])
+    return applied, []
+
+
+def _conflict(entry: CopyEntry, row: asyncpg.Record | None, *,
+              reason: str, detail: str) -> dict:
+    baseline = entry.baseline
+    return {
+        "target_path": entry.target_path,
+        "source_path": entry.source_path,
+        "reason": reason,
+        "detail": detail,
+        "expected_sha256": entry.sha256,
+        "actual_sha256": None if row is None else row["sha256"],
+        "actual_revision_no": None if row is None else row["revision_no"],
+        "baseline": {
+            "existed": baseline.revision_id is not None,
+            "revision_id": baseline.revision_id,
+            "revision_no": baseline.revision_no,
+            "sha256": baseline.sha256,
+        },
+    }

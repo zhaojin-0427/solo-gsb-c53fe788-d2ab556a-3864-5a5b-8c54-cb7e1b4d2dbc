@@ -78,11 +78,37 @@ CREATE TABLE IF NOT EXISTS copy_session_entries (
     sha256      text NOT NULL CHECK (char_length(sha256) = 64),
     media_type  text NOT NULL,
     length      bigint NOT NULL,
+    -- Revision-identity baseline of the target path captured in the very
+    -- same snapshot as the source manifest.  A NULL baseline_revision_id
+    -- pins "target did not exist (had no revision) yet".  Acknowledgement
+    -- compares revision *identity* against this baseline, so a same-bytes
+    -- re-publish after session creation cannot masquerade as
+    -- already_present.  baseline_captured is FALSE for rows that existed
+    -- before this column existed (upgrade-era sessions): such sessions
+    -- must not be acknowledged by digest comparison alone.
+    baseline_captured   boolean NOT NULL DEFAULT FALSE,
+    baseline_revision_id bigint REFERENCES revisions (id),
+    baseline_revision_no bigint,
+    baseline_sha256      text
+                           CHECK (baseline_sha256 IS NULL
+                                  OR char_length(baseline_sha256) = 64),
     PRIMARY KEY (session_id, ordinal)
 );
 
 CREATE INDEX IF NOT EXISTS copy_session_entries_segment_idx
     ON copy_session_entries (session_id, segment_no, ordinal);
+
+-- Upgrade path for databases created before revision baselines existed:
+-- existing manifest rows keep baseline_captured = FALSE (the column
+-- default), which marks them as sessions without a usable baseline.
+ALTER TABLE copy_session_entries
+    ADD COLUMN IF NOT EXISTS baseline_captured boolean NOT NULL DEFAULT FALSE;
+ALTER TABLE copy_session_entries
+    ADD COLUMN IF NOT EXISTS baseline_revision_id bigint REFERENCES revisions (id);
+ALTER TABLE copy_session_entries
+    ADD COLUMN IF NOT EXISTS baseline_revision_no bigint;
+ALTER TABLE copy_session_entries
+    ADD COLUMN IF NOT EXISTS baseline_sha256 text;
 
 -- One row per acknowledged segment: the persisted batch result that
 -- makes repeated acknowledgements and replays byte-identical.  Stored
